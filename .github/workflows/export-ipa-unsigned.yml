@@ -10,7 +10,7 @@ on:
         type: string
       scheme:
         description: Xcode scheme
-        required: true
+        required: false
         type: string
       project:
         description: Optional .xcodeproj path
@@ -26,7 +26,7 @@ on:
         default: Release
         type: string
       source_url:
-        description: Short-lived HTTPS URL for an uploaded Xcode source ZIP
+        description: Short-lived HTTPS URL for an uploaded source ZIP
         required: false
         type: string
       source_name:
@@ -36,6 +36,16 @@ on:
       source_sha256:
         description: SHA-256 of the uploaded source archive
         required: false
+        type: string
+      build_system:
+        description: Build system (xcode or gradle)
+        required: false
+        default: xcode
+        type: string
+      gradle_task:
+        description: Gradle task used for RoboVM IPA export
+        required: false
+        default: ios:createIPA
         type: string
 
 jobs:
@@ -48,6 +58,8 @@ jobs:
       contents: read
     env:
       EXPORT_ID: ${{ inputs.export_id }}
+      BUILD_SYSTEM: ${{ inputs.build_system }}
+      GRADLE_TASK: ${{ inputs.gradle_task }}
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - name: Validate export request
@@ -55,9 +67,20 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$EXPORT_ID" =~ ^[a-f0-9]{32}$ ]] || { echo 'Invalid export id.' >&2; exit 2; }
+          BUILD_SYSTEM="${BUILD_SYSTEM:-xcode}"
+          GRADLE_TASK="${GRADLE_TASK:-ios:createIPA}"
+          [[ "$BUILD_SYSTEM" == xcode || "$BUILD_SYSTEM" == gradle ]] || { echo 'Build system must be xcode or gradle.' >&2; exit 2; }
+          [[ "$GRADLE_TASK" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]] || { echo 'Invalid Gradle task.' >&2; exit 2; }
           [[ -d "$DEVELOPER_DIR" ]] || { echo 'Configured Xcode is unavailable on this runner.' >&2; exit 2; }
           xcodebuild -version
           xcodebuild -showsdks
+
+      - name: Set up Java for RoboVM
+        if: ${{ inputs.build_system == 'gradle' }}
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Check out source
         if: ${{ inputs.source_url == '' }}
@@ -70,6 +93,9 @@ jobs:
         env:
           SOURCE_URL: ${{ inputs.source_url }}
           SOURCE_SHA256: ${{ inputs.source_sha256 }}
+          BUILD_SYSTEM: ${{ inputs.build_system }}
+          PROJECT_INPUT: ${{ inputs.project }}
+          WORKSPACE_INPUT: ${{ inputs.workspace }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -80,7 +106,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/source"
           mkdir -p "$RUNNER_TEMP/source"
           python3 - "$RUNNER_TEMP/source.zip" "$RUNNER_TEMP/source" <<'PY'
-          import pathlib, shutil, sys, zipfile
+          import os, pathlib, re, shutil, sys, zipfile
           archive, destination = map(pathlib.Path, sys.argv[1:])
           max_entries, max_total, max_file, max_ratio = 200000, 8 * 1024**3, 512 * 1024**2, 1000
           seen, total = set(), 0
@@ -91,7 +117,7 @@ jobs:
               for info in infos:
                   name = info.filename.replace('\\', '/')
                   parts = name.split('/')
-                  if (not name or name.startswith('/') or ':' in parts[0]
+                  if (not name or name.startswith('/') or ':' in parts[0] or '\x00' in name
                           or any(part in {'', '.', '..'} for part in parts[:-1]) or name in seen
                           or info.flag_bits & 0x1):
                       raise SystemExit('Unsafe, encrypted or duplicate source archive path.')
@@ -112,31 +138,57 @@ jobs:
                   target.parent.mkdir(parents=True, exist_ok=True)
                   with zf.open(info) as source, target.open('wb') as output:
                       shutil.copyfileobj(source, output, 1024 * 1024)
-          for selected in ("${{ inputs.project }}", "${{ inputs.workspace }}"):
-              if selected:
-                  path = destination / pathlib.PurePosixPath(selected)
-                  if not path.is_dir() or path.is_symlink():
-                      raise SystemExit(f'Selected Xcode path is not a directory: {selected}')
-          if not "${{ inputs.project }}" and not "${{ inputs.workspace }}":
-              candidates = []
-              for path in destination.rglob("*.xcodeproj"):
-                  if (path / "project.pbxproj").is_file(): candidates.append(("project", path.relative_to(destination).as_posix()))
-              for path in destination.rglob("*.xcworkspace"):
-                  if (path / "contents.xcworkspacedata").is_file(): candidates.append(("workspace", path.relative_to(destination).as_posix()))
-              if len(candidates) != 1:
-                  raise SystemExit('Uploaded source must contain exactly one selectable Xcode project or workspace.')
-              pathlib.Path("$RUNNER_TEMP/source-selection").write_text(candidates[0][0] + "\n" + candidates[0][1] + "\n")
+          def set_env(name, value):
+              if '\r' in value or '\n' in value or '\x00' in value:
+                  raise SystemExit('Build path contains unsupported control characters.')
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+                  output.write(f'{name}={value}\n')
+
+          build_system = os.environ.get('BUILD_SYSTEM') or 'xcode'
+          if build_system == 'gradle':
+              wrappers = [path for path in destination.rglob('gradlew')
+                          if path.is_file() and not path.is_symlink()
+                          and any((path.parent / name).is_file() for name in
+                                  ('build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts'))
+                          and any((path.parent / 'ios' / name).is_file() for name in
+                                  ('build.gradle', 'build.gradle.kts'))
+                          and (path.parent / 'gradle/wrapper/gradle-wrapper.jar').is_file()
+                          and (path.parent / 'gradle/wrapper/gradle-wrapper.properties').is_file()]
+              # A source ZIP must have one unambiguous Gradle wrapper. The
+              # parent is recorded so projects wrapped in a top-level folder
+              # build from their own root without trusting user input paths.
+              if len(wrappers) != 1:
+                  raise SystemExit('Uploaded source must contain exactly one Gradle wrapper (gradlew).')
+              set_env('SOURCE_ROOT', wrappers[0].parent.relative_to(destination).as_posix())
+          else:
+              project = os.environ.get('PROJECT_INPUT', '')
+              workspace = os.environ.get('WORKSPACE_INPUT', '')
+              for selected in (project, workspace):
+                  if selected:
+                      if (not re.fullmatch(r'[A-Za-z0-9_ ./-]{1,255}', selected)
+                              or any(part in ('', '.', '..') for part in selected.split('/'))):
+                          raise SystemExit('Selected Xcode path is not a safe relative path.')
+                      path = destination / selected
+                      if not path.is_dir() or path.is_symlink() or not path.resolve().is_relative_to(destination.resolve()):
+                          raise SystemExit(f'Selected Xcode path is not a directory: {selected}')
+              if not project and not workspace:
+                  candidates = []
+                  for path in destination.rglob("*.xcodeproj"):
+                      if (path / "project.pbxproj").is_file(): candidates.append(("project", path.relative_to(destination).as_posix()))
+                  for path in destination.rglob("*.xcworkspace"):
+                      if not any(parent.name.endswith('.xcodeproj') for parent in path.parents) and (path / "contents.xcworkspacedata").is_file():
+                          candidates.append(("workspace", path.relative_to(destination).as_posix()))
+                  if len(candidates) != 1:
+                      raise SystemExit('Uploaded source must contain exactly one selectable Xcode project or workspace.')
+                  set_env('SOURCE_PROJECT' if candidates[0][0] == 'project' else 'SOURCE_WORKSPACE', candidates[0][1])
           PY
-          if [[ -f "$RUNNER_TEMP/source-selection" ]]; then
-            read -r SOURCE_KIND SOURCE_PATH < <(tr '\n' ' ' < "$RUNNER_TEMP/source-selection")
-            if [[ "$SOURCE_KIND" == project ]]; then echo "SOURCE_PROJECT=$SOURCE_PATH" >> "$GITHUB_ENV"; else echo "SOURCE_WORKSPACE=$SOURCE_PATH" >> "$GITHUB_ENV"; fi
-          fi
           unset SOURCE_URL SOURCE_SHA256
 
       # Add project-specific dependency installation here, before archiving.
       # For CocoaPods, commit Podfile.lock and select the generated workspace.
 
-      - name: Build without code signing
+      - name: Build without code signing (Xcode)
+        if: ${{ inputs.build_system != 'gradle' }}
         env:
           SCHEME: ${{ inputs.scheme }}
           PROJECT_INPUT: ${{ inputs.project }}
@@ -189,6 +241,66 @@ jobs:
           shutil.copytree(apps[0], payload / apps[0].name, symlinks=True)
           PY
           (cd "$RUNNER_TEMP/ipa" && zip -qry "$RUNNER_TEMP/unsigned-${EXPORT_ID}.ipa" Payload)
+
+      - name: Grant execute permission for gradlew
+        if: ${{ inputs.build_system == 'gradle' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          if [[ -f "$RUNNER_TEMP/source.zip" ]]; then
+            ROOT="$RUNNER_TEMP/source/${SOURCE_ROOT:-}"
+          fi
+          [[ -d "$ROOT" ]] || { echo 'Gradle project root is missing.' >&2; exit 2; }
+          [[ -f "$ROOT/gradlew" && ! -L "$ROOT/gradlew" ]] || { echo 'Gradle wrapper gradlew was not found.' >&2; exit 2; }
+          python3 - "$ROOT/gradlew" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          path.write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
+          PY
+          chmod +x "$ROOT/gradlew"
+
+      - name: Build IPA with RoboVM
+        if: ${{ inputs.build_system == 'gradle' }}
+        env:
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          if [[ -f "$RUNNER_TEMP/source.zip" ]]; then
+            ROOT="$RUNNER_TEMP/source/${SOURCE_ROOT:-}"
+          fi
+          cd "$ROOT"
+          TASK="${GRADLE_TASK:-ios:createIPA}"
+          [[ "$TASK" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]] || { echo 'Invalid Gradle task.' >&2; exit 2; }
+          # ZIPs made on development machines can include old build results.
+          # Only an IPA created by this invocation may become the artifact.
+          python3 <<'PY'
+          import pathlib
+          for output in pathlib.Path('ios/build/robovm').glob('*.ipa'):
+              if output.is_file() or output.is_symlink():
+                  output.unlink()
+          PY
+          ./gradlew "$TASK" --stacktrace -Probovm.iosSkipSigning=true -Probovm.archs=arm64
+          python3 <<'PY'
+          import os, pathlib, plistlib, shutil, zipfile
+          artifacts = [path for path in pathlib.Path('ios/build/robovm').glob('*.ipa')
+                       if path.is_file() and not path.is_symlink()]
+          if len(artifacts) != 1:
+              raise SystemExit(f'Expected exactly one new IPA in ios/build/robovm, found {len(artifacts)}.')
+          with zipfile.ZipFile(artifacts[0]) as ipa:
+              infos = [name for name in ipa.namelist()
+                       if len(pathlib.PurePosixPath(name).parts) == 3 and name.startswith('Payload/')
+                       and pathlib.PurePosixPath(name).parts[1].endswith('.app') and name.endswith('/Info.plist')]
+              if len(infos) != 1:
+                  raise SystemExit('RoboVM output must contain exactly one iOS application under Payload.')
+              info = plistlib.loads(ipa.read(infos[0]))
+              if info.get('CFBundlePackageType') != 'APPL' or 'iPhoneOS' not in info.get('CFBundleSupportedPlatforms', []):
+                  raise SystemExit('RoboVM output must be an iOS device IPA, not a simulator application.')
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / ('unsigned-' + os.environ['EXPORT_ID'] + '.ipa')
+          shutil.copyfile(artifacts[0], target)
+          PY
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
