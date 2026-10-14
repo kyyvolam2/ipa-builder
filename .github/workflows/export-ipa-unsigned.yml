@@ -1,0 +1,200 @@
+name: Export unsigned IPA
+run-name: "tfm-export-${{ inputs.export_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_id:
+        description: TestFlight Manager export id
+        required: true
+        type: string
+      scheme:
+        description: Xcode scheme
+        required: true
+        type: string
+      project:
+        description: Optional .xcodeproj path
+        required: false
+        type: string
+      workspace:
+        description: Optional .xcworkspace path
+        required: false
+        type: string
+      configuration:
+        description: Xcode configuration
+        required: true
+        default: Release
+        type: string
+      source_url:
+        description: Short-lived HTTPS URL for an uploaded Xcode source ZIP
+        required: false
+        type: string
+      source_name:
+        description: Uploaded source archive name
+        required: false
+        type: string
+      source_sha256:
+        description: SHA-256 of the uploaded source archive
+        required: false
+        type: string
+
+jobs:
+  export:
+    # This workflow intentionally produces an unsigned artifact. It is not a
+    # TestFlight upload and must be signed by a separate trusted pipeline.
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      EXPORT_ID: ${{ inputs.export_id }}
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Validate export request
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPORT_ID" =~ ^[a-f0-9]{32}$ ]] || { echo 'Invalid export id.' >&2; exit 2; }
+          [[ -d "$DEVELOPER_DIR" ]] || { echo 'Configured Xcode is unavailable on this runner.' >&2; exit 2; }
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Check out source
+        if: ${{ inputs.source_url == '' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download uploaded source archive
+        if: ${{ inputs.source_url != '' }}
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          SOURCE_SHA256: ${{ inputs.source_sha256 }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_URL" == https://* && "$SOURCE_URL" != *$'\n'* && "$SOURCE_URL" != *$' '* ]] || { echo 'Invalid source URL.' >&2; exit 2; }
+          [[ "$SOURCE_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo 'Invalid source digest.' >&2; exit 2; }
+          curl --fail --location --retry 2 --connect-timeout 15 --max-time 900 "$SOURCE_URL" -o "$RUNNER_TEMP/source.zip"
+          echo "$SOURCE_SHA256  $RUNNER_TEMP/source.zip" | shasum -a 256 -c -
+          rm -rf "$RUNNER_TEMP/source"
+          mkdir -p "$RUNNER_TEMP/source"
+          python3 - "$RUNNER_TEMP/source.zip" "$RUNNER_TEMP/source" <<'PY'
+          import pathlib, shutil, sys, zipfile
+          archive, destination = map(pathlib.Path, sys.argv[1:])
+          max_entries, max_total, max_file, max_ratio = 200000, 8 * 1024**3, 512 * 1024**2, 1000
+          seen, total = set(), 0
+          with zipfile.ZipFile(archive) as zf:
+              infos = zf.infolist()
+              if not infos or len(infos) > max_entries:
+                  raise SystemExit('Source archive contains too many entries.')
+              for info in infos:
+                  name = info.filename.replace('\\', '/')
+                  parts = name.split('/')
+                  if (not name or name.startswith('/') or ':' in parts[0]
+                          or any(part in {'', '.', '..'} for part in parts[:-1]) or name in seen
+                          or info.flag_bits & 0x1):
+                      raise SystemExit('Unsafe, encrypted or duplicate source archive path.')
+                  if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                      raise SystemExit('Source archive symlinks are not allowed.')
+                  seen.add(name)
+                  total += info.file_size
+                  if info.file_size > max_file or total > max_total:
+                      raise SystemExit('Source archive is too large.')
+                  if info.compress_size and info.file_size > info.compress_size * max_ratio + 1024 * 1024:
+                      raise SystemExit('Source archive compression ratio is unsafe.')
+                  target = (destination / pathlib.PurePosixPath(name)).resolve()
+                  if not target.is_relative_to(destination.resolve()):
+                      raise SystemExit('Source archive path escapes extraction directory.')
+                  if name.endswith('/'):
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info) as source, target.open('wb') as output:
+                      shutil.copyfileobj(source, output, 1024 * 1024)
+          for selected in ("${{ inputs.project }}", "${{ inputs.workspace }}"):
+              if selected:
+                  path = destination / pathlib.PurePosixPath(selected)
+                  if not path.is_dir() or path.is_symlink():
+                      raise SystemExit(f'Selected Xcode path is not a directory: {selected}')
+          if not "${{ inputs.project }}" and not "${{ inputs.workspace }}":
+              candidates = []
+              for path in destination.rglob("*.xcodeproj"):
+                  if (path / "project.pbxproj").is_file(): candidates.append(("project", path.relative_to(destination).as_posix()))
+              for path in destination.rglob("*.xcworkspace"):
+                  if (path / "contents.xcworkspacedata").is_file(): candidates.append(("workspace", path.relative_to(destination).as_posix()))
+              if len(candidates) != 1:
+                  raise SystemExit('Uploaded source must contain exactly one selectable Xcode project or workspace.')
+              pathlib.Path("$RUNNER_TEMP/source-selection").write_text(candidates[0][0] + "\n" + candidates[0][1] + "\n")
+          PY
+          if [[ -f "$RUNNER_TEMP/source-selection" ]]; then
+            read -r SOURCE_KIND SOURCE_PATH < <(tr '\n' ' ' < "$RUNNER_TEMP/source-selection")
+            if [[ "$SOURCE_KIND" == project ]]; then echo "SOURCE_PROJECT=$SOURCE_PATH" >> "$GITHUB_ENV"; else echo "SOURCE_WORKSPACE=$SOURCE_PATH" >> "$GITHUB_ENV"; fi
+          fi
+          unset SOURCE_URL SOURCE_SHA256
+
+      # Add project-specific dependency installation here, before archiving.
+      # For CocoaPods, commit Podfile.lock and select the generated workspace.
+
+      - name: Build without code signing
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          PROJECT_INPUT: ${{ inputs.project }}
+          WORKSPACE_INPUT: ${{ inputs.workspace }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PROJECT="${PROJECT_INPUT:-${SOURCE_PROJECT:-}}"
+          WORKSPACE="${WORKSPACE_INPUT:-${SOURCE_WORKSPACE:-}}"
+          [[ -n "$SCHEME" && -n "$CONFIGURATION" ]] || { echo 'Scheme and configuration are required.' >&2; exit 2; }
+          [[ -z "$PROJECT" || -z "$WORKSPACE" ]] || { echo 'Select project OR workspace.' >&2; exit 2; }
+          if [[ -n "${SOURCE_URL:-}" || -f "$RUNNER_TEMP/source.zip" ]]; then
+            [[ -d "$RUNNER_TEMP/source" ]] || { echo 'Uploaded source was not extracted.' >&2; exit 2; }
+            [[ -z "$PROJECT" || -e "$RUNNER_TEMP/source/$PROJECT" ]] || { echo 'Project path is missing from source ZIP.' >&2; exit 2; }
+            [[ -z "$WORKSPACE" || -e "$RUNNER_TEMP/source/$WORKSPACE" ]] || { echo 'Workspace path is missing from source ZIP.' >&2; exit 2; }
+            cd "$RUNNER_TEMP/source"
+          fi
+          args=(-scheme "$SCHEME" -configuration "$CONFIGURATION" -sdk iphoneos
+            -destination 'generic/platform=iOS'
+            -archivePath "$RUNNER_TEMP/export.xcarchive"
+            -derivedDataPath "$RUNNER_TEMP/derived-data"
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 'CODE_SIGN_IDENTITY=')
+          if [[ -n "$WORKSPACE" ]]; then
+            args=(-workspace "$WORKSPACE" "${args[@]}")
+          elif [[ -n "$PROJECT" ]]; then
+            args=(-project "$PROJECT" "${args[@]}")
+          else
+            echo 'Set project or workspace in the Export IPA form.' >&2
+            exit 2
+          fi
+          xcodebuild archive "${args[@]}"
+          python3 <<'PY'
+          import os
+          import pathlib
+          import plistlib
+          import shutil
+
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          applications = temp / 'export.xcarchive/Products/Applications'
+          apps = [path for path in applications.glob('*.app') if path.is_dir() and not path.is_symlink()]
+          if len(apps) != 1:
+              raise SystemExit(f'Expected exactly one archived .app, found {len(apps)}. Check the shared scheme archive targets.')
+          with (apps[0] / 'Info.plist').open('rb') as stream:
+              info = plistlib.load(stream)
+          if info.get('CFBundlePackageType') != 'APPL' or 'iPhoneOS' not in info.get('CFBundleSupportedPlatforms', []):
+              raise SystemExit('Archive must contain an iOS device application, not a simulator application.')
+          payload = temp / 'ipa/Payload'
+          payload.mkdir(parents=True, exist_ok=False)
+          shutil.copytree(apps[0], payload / apps[0].name, symlinks=True)
+          PY
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$RUNNER_TEMP/unsigned-${EXPORT_ID}.ipa" Payload)
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-ipa-${{ inputs.export_id }}
+          path: ${{ runner.temp }}/unsigned-${{ inputs.export_id }}.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
