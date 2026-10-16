@@ -107,9 +107,11 @@ jobs:
             --platform iphoneos \
             --minimum-deployment-target "$MINIMUM_IOS" \
             --app-icon AppIcon \
+            --output-partial-info-plist "$RUNNER_TEMP/compiled/partial.plist" \
             --output-format human-readable-text \
             --notices --warnings
           [[ -f "$RUNNER_TEMP/compiled/Assets.car" ]] || { echo 'actool did not produce Assets.car.' >&2; exit 3; }
+          [[ -f "$RUNNER_TEMP/compiled/partial.plist" ]] || { echo 'actool did not produce partial Info.plist.' >&2; exit 3; }
           CAR_BYTES="$(wc -c < "$RUNNER_TEMP/compiled/Assets.car")"
           [[ "$CAR_BYTES" -ge 32 && "$CAR_BYTES" -le 1073741824 ]] || { echo 'Assets.car size is outside the safe limit.' >&2; exit 3; }
           [[ "$(head -c 8 "$RUNNER_TEMP/compiled/Assets.car")" == BOMStore ]] || { echo 'Assets.car has an invalid CoreUI header.' >&2; exit 3; }
